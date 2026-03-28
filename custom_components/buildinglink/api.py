@@ -22,8 +22,15 @@ TENANT_PATH = "V2/Tenant"
 HOME_PATH = "Home/DefaultNew.aspx"
 
 # Azure subscription key from BuildingLink frontend assets
-# https://frontend-assets.buildinglink.com/js-shared-config-micro/1.0.24/js/index.js
+# https://frontend-assets.buildinglink.com/js-shared-config-micro/1.0.28/js/index.js
 SUBSCRIPTION_KEY = "d56c27729c5845ba94f51efd93155a71"
+
+# Mimic a real browser so BuildingLink doesn't reject headless requests
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 class _FormParser(HTMLParser):
@@ -83,7 +90,12 @@ class BuildingLinkApi:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # Use DummyCookieJar so aiohttp doesn't manage cookies alongside us.
+            # Our code does all cookie tracking manually to match the TypeScript client.
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(),
+                headers={"User-Agent": _USER_AGENT},
+            )
             self._owns_session = True
         return self._session
 
@@ -221,11 +233,27 @@ class BuildingLinkApi:
 
     # ── High-level helpers ───────────────────────────────────────────
 
+    def _api_headers(self) -> dict[str, str]:
+        """Build headers for API requests.
+
+        Only includes Authorization when we have a real access token.
+        Without one, Azure APIM falls back to validating the subscription key alone
+        (matching the TypeScript client's ``Bearer undefined`` behaviour).
+        """
+        headers: dict[str, str] = {"ocp-apim-subscription-key": SUBSCRIPTION_KEY}
+        access_token = (self._token or {}).get("access_token", "")
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        _LOGGER.debug(
+            "BuildingLink API headers: has_token=%s", bool(access_token)
+        )
+        return headers
+
     async def _api(
         self, path: str, params: dict[str, Any] | None = None
     ) -> Any:
         """Make an authenticated API call and return parsed JSON."""
-        if not self._token:
+        if not self.is_authenticated:
             raise BuildingLinkApiError("Not authenticated — call login() first")
 
         url = f"{API_BASE_URL}/{path}"
@@ -235,14 +263,9 @@ class BuildingLinkApi:
 
         session = await self._ensure_session()
 
-        req_headers = {
-            "Authorization": f"Bearer {self._token.get('access_token', '')}",
-            "ocp-apim-subscription-key": SUBSCRIPTION_KEY,
-        }
-
         _LOGGER.debug("BuildingLink API GET %s", url)
 
-        async with session.get(url, headers=req_headers, ssl=True) as resp:
+        async with session.get(url, headers=self._api_headers(), ssl=True) as resp:
             if not resp.ok:
                 text = await resp.text()
                 raise BuildingLinkApiError(
@@ -266,10 +289,10 @@ class BuildingLinkApi:
             raise BuildingLinkAuthError(
                 "Authentication failed — no session cookie received"
             )
-        if not self._token or "access_token" not in self._token:
-            raise BuildingLinkAuthError(
-                "Authentication failed — no access token received"
-            )
+        _LOGGER.debug(
+            "BuildingLink token fields: %s",
+            list(self._token.keys()) if self._token else "none",
+        )
 
         _LOGGER.info("BuildingLink authentication successful")
 
@@ -287,13 +310,9 @@ class BuildingLinkApi:
         while url:
             # For paginated calls, url may be absolute
             if url.startswith("http"):
-                # Direct API call for pagination
+                # Absolute URL from @odata.nextLink — call directly
                 session = await self._ensure_session()
-                req_headers = {
-                    "Authorization": f"Bearer {self._token.get('access_token', '')}",
-                    "ocp-apim-subscription-key": SUBSCRIPTION_KEY,
-                }
-                async with session.get(url, headers=req_headers, ssl=True) as resp:
+                async with session.get(url, headers=self._api_headers(), ssl=True) as resp:
                     if not resp.ok:
                         text = await resp.text()
                         raise BuildingLinkApiError(
@@ -301,7 +320,10 @@ class BuildingLinkApi:
                         )
                     data = await resp.json()
             else:
-                data = await self._api(url, params if url == "EventLog/Resident/v1/Events" else None)
+                data = await self._api(
+                    url,
+                    params if url == "EventLog/Resident/v1/Events" else None,
+                )
 
             if "value" in data:
                 deliveries.extend(data["value"])
