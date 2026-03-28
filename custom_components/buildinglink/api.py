@@ -10,7 +10,7 @@ import logging
 import re
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlencode as _urlencode
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlencode as _urlencode, unquote
 
 import aiohttp
 
@@ -90,10 +90,10 @@ class BuildingLinkApi:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            # Use DummyCookieJar so aiohttp doesn't manage cookies alongside us.
-            # Our code does all cookie tracking manually to match the TypeScript client.
+            # Use the default CookieJar so aiohttp handles per-domain cookie routing
+            # correctly during the multi-domain OIDC flow. We still track cookies
+            # manually in self._cookies so we control what gets sent where.
             self._session = aiohttp.ClientSession(
-                cookie_jar=aiohttp.DummyCookieJar(),
                 headers={"User-Agent": _USER_AGENT},
             )
             self._owns_session = True
@@ -149,11 +149,11 @@ class BuildingLinkApi:
             allow_redirects=False,
             ssl=True,
         ) as resp:
-            # Update cookies from response
+            # Update cookies from response — URL-decode values to match TypeScript client
             for cookie_header in resp.headers.getall("Set-Cookie", []):
                 parts = cookie_header.split(";")[0].split("=", 1)
                 if len(parts) == 2:
-                    self._cookies[parts[0].strip()] = parts[1].strip()
+                    self._cookies[parts[0].strip()] = unquote(parts[1].strip())
 
             status = resp.status
             resp_headers = {k: v for k, v in resp.headers.items()}
@@ -164,16 +164,19 @@ class BuildingLinkApi:
             location = resp_headers.get("Location", "")
             if location.startswith("/"):
                 location = urljoin(url, location)
-                # Add internal_resident_app_apis scope if present
-                parsed_loc = urlparse(location)
-                qs = parse_qs(parsed_loc.query)
-                if "scope" in qs:
-                    scope = qs["scope"][0]
-                    if "internal_resident_app_apis" not in scope:
-                        scope += " internal_resident_app_apis"
-                        qs["scope"] = [scope]
-                        new_query = _urlencode(qs, doseq=True)
-                        location = parsed_loc._replace(query=new_query).geturl()
+
+            # Inject internal_resident_app_apis into the OAuth scope wherever it appears.
+            # This matches the TypeScript client and ensures the returned access_token
+            # has the scope required by the BuildingLink API.
+            parsed_loc = urlparse(location)
+            qs = parse_qs(parsed_loc.query)
+            if "scope" in qs:
+                scope = qs["scope"][0]
+                if "internal_resident_app_apis" not in scope:
+                    scope += " internal_resident_app_apis"
+                    qs["scope"] = [scope]
+                    new_query = _urlencode(qs, doseq=True)
+                    location = parsed_loc._replace(query=new_query).geturl()
 
             return await self._fetch(location)
 
