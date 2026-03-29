@@ -21,9 +21,15 @@ API_BASE_URL = "https://api.buildinglink.com"
 TENANT_PATH = "V2/Tenant"
 HOME_PATH = "Home/DefaultNew.aspx"
 
-# Azure subscription key from BuildingLink frontend assets
+# Azure subscription key — works for Properties/ContentCreator products,
+# but NOT for EventLog (different APIM product, key is rejected).
 # https://frontend-assets.buildinglink.com/js-shared-config-micro/1.0.28/js/index.js
 SUBSCRIPTION_KEY = "d56c27729c5845ba94f51efd93155a71"
+
+# BuildingLink proxies EventLog calls through www.buildinglink.com/api/.
+# The proxy injects the correct subscription key server-side, so only the
+# session cookie is needed.
+API_PROXY_PATH = "/api"
 
 # Mimic a real browser so BuildingLink doesn't reject headless requests
 _USER_AGENT = (
@@ -236,26 +242,18 @@ class BuildingLinkApi:
 
     # ── High-level helpers ───────────────────────────────────────────
 
-    def _api_headers(self) -> dict[str, str]:
-        """Build headers for API requests.
-
-        Only includes Authorization when we have a real access token.
-        Without one, Azure APIM falls back to validating the subscription key alone
-        (matching the TypeScript client's ``Bearer undefined`` behaviour).
-        """
-        headers: dict[str, str] = {"ocp-apim-subscription-key": SUBSCRIPTION_KEY}
-        access_token = (self._token or {}).get("access_token", "")
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
-        _LOGGER.debug(
-            "BuildingLink API headers: has_token=%s", bool(access_token)
-        )
-        return headers
+    def _cookie_header(self) -> str:
+        """Build a Cookie header string from the tracked cookies."""
+        return "; ".join(f"{k}={v}" for k, v in self._cookies.items())
 
     async def _api(
         self, path: str, params: dict[str, Any] | None = None
     ) -> Any:
-        """Make an authenticated API call and return parsed JSON."""
+        """Call the BuildingLink API using Bearer + subscription key.
+
+        Works for Properties and ContentCreator endpoints.
+        For EventLog endpoints, use :meth:`_api_proxy` instead.
+        """
         if not self.is_authenticated:
             raise BuildingLinkApiError("Not authenticated — call login() first")
 
@@ -265,10 +263,48 @@ class BuildingLinkApi:
             url = f"{url}?{qs}"
 
         session = await self._ensure_session()
+        headers: dict[str, str] = {
+            "ocp-apim-subscription-key": SUBSCRIPTION_KEY,
+        }
+        access_token = (self._token or {}).get("access_token", "")
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
 
         _LOGGER.debug("BuildingLink API GET %s", url)
 
-        async with session.get(url, headers=self._api_headers(), ssl=True) as resp:
+        async with session.get(url, headers=headers, ssl=True) as resp:
+            if not resp.ok:
+                text = await resp.text()
+                raise BuildingLinkApiError(
+                    f"API error {resp.status} for {path}: {text}"
+                )
+            return await resp.json()
+
+    async def _api_proxy(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> Any:
+        """Call the BuildingLink API via the cookie-authenticated proxy.
+
+        ``www.buildinglink.com/api/*`` proxies to the Azure APIM backend
+        and injects the correct subscription key server-side. Only the
+        session cookie is needed.  Required for EventLog endpoints whose
+        APIM product rejects the public JS subscription key.
+        """
+        if not self.is_authenticated:
+            raise BuildingLinkApiError("Not authenticated — call login() first")
+
+        url = f"{BASE_URL}{API_PROXY_PATH}/{path}"
+        if params:
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"{url}?{qs}"
+
+        session = await self._ensure_session()
+
+        _LOGGER.debug("BuildingLink API proxy GET %s", url)
+
+        async with session.get(
+            url, headers={"Cookie": self._cookie_header()}, ssl=True
+        ) as resp:
             if not resp.ok:
                 text = await resp.text()
                 raise BuildingLinkApiError(
@@ -300,32 +336,28 @@ class BuildingLinkApi:
         _LOGGER.info("BuildingLink authentication successful")
 
     async def get_deliveries(self) -> list[dict[str, Any]]:
-        """Fetch all open deliveries via the OData API."""
+        """Fetch all open deliveries via the cookie-authenticated API proxy."""
         params = {
             "$expand": "Location,Type,Authorizations",
             "$filter": "IsOpen eq true and Type/IsShownOnTenantHomePage eq true",
             "$skip": "0",
         }
 
-        url: str | None = "EventLog/Resident/v1/Events"
+        first_path = "EventLog/Resident/v1/Events"
+        url: str | None = first_path
         deliveries: list[dict[str, Any]] = []
 
         while url:
-            # For paginated calls, url may be absolute
             if url.startswith("http"):
-                # Absolute URL from @odata.nextLink — call directly
-                session = await self._ensure_session()
-                async with session.get(url, headers=self._api_headers(), ssl=True) as resp:
-                    if not resp.ok:
-                        text = await resp.text()
-                        raise BuildingLinkApiError(
-                            f"API error {resp.status}: {text}"
-                        )
-                    data = await resp.json()
+                # Absolute @odata.nextLink — rewrite to go through the proxy
+                parsed = urlparse(url)
+                path = parsed.path.lstrip("/")
+                data = await self._api_proxy(
+                    path + (f"?{parsed.query}" if parsed.query else "")
+                )
             else:
-                data = await self._api(
-                    url,
-                    params if url == "EventLog/Resident/v1/Events" else None,
+                data = await self._api_proxy(
+                    url, params if url == first_path else None
                 )
 
             if "value" in data:
