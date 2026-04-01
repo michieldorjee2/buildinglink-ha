@@ -10,7 +10,7 @@ import logging
 import re
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlencode as _urlencode, unquote
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlencode as _urlencode, unquote  # noqa: F811
 
 import aiohttp
 
@@ -18,18 +18,17 @@ _LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://www.buildinglink.com"
 API_BASE_URL = "https://api.buildinglink.com"
+EVENTLOG_BASE_URL = "https://eventlog-us1.buildinglink.com"
 TENANT_PATH = "V2/Tenant"
 HOME_PATH = "Home/DefaultNew.aspx"
 
-# Azure subscription key — works for Properties/ContentCreator products,
-# but NOT for EventLog (different APIM product, key is rejected).
+# Azure subscription key — works for Properties/ContentCreator products.
 # https://frontend-assets.buildinglink.com/js-shared-config-micro/1.0.28/js/index.js
 SUBSCRIPTION_KEY = "d56c27729c5845ba94f51efd93155a71"
 
-# BuildingLink proxies EventLog calls through www.buildinglink.com/api/.
-# The proxy injects the correct subscription key server-side, so only the
-# session cookie is needed.
-API_PROXY_PATH = "/api"
+# API key for the new EventLog microservice (eventlog-us1.buildinglink.com).
+# Found in the Vue micro-frontend's network requests.
+EVENTLOG_API_KEY = "hylwvvmjdgc45mt9kab1agriyvuh0nig9qx8djmu"
 
 # Mimic a real browser so BuildingLink doesn't reject headless requests
 _USER_AGENT = (
@@ -280,38 +279,6 @@ class BuildingLinkApi:
                 )
             return await resp.json()
 
-    async def _api_proxy(
-        self, path: str, params: dict[str, Any] | None = None
-    ) -> Any:
-        """Call the BuildingLink API via the cookie-authenticated proxy.
-
-        ``www.buildinglink.com/api/*`` proxies to the Azure APIM backend
-        and injects the correct subscription key server-side. Only the
-        session cookie is needed.  Required for EventLog endpoints whose
-        APIM product rejects the public JS subscription key.
-        """
-        if not self.is_authenticated:
-            raise BuildingLinkApiError("Not authenticated — call login() first")
-
-        url = f"{BASE_URL}{API_PROXY_PATH}/{path}"
-        if params:
-            qs = "&".join(f"{k}={v}" for k, v in params.items())
-            url = f"{url}?{qs}"
-
-        session = await self._ensure_session()
-
-        _LOGGER.debug("BuildingLink API proxy GET %s", url)
-
-        async with session.get(
-            url, headers={"Cookie": self._cookie_header()}, ssl=True
-        ) as resp:
-            if not resp.ok:
-                text = await resp.text()
-                raise BuildingLinkApiError(
-                    f"API error {resp.status} for {path}: {text}"
-                )
-            return await resp.json()
-
     async def login(self) -> None:
         """Authenticate with BuildingLink.
 
@@ -336,36 +303,39 @@ class BuildingLinkApi:
         _LOGGER.info("BuildingLink authentication successful")
 
     async def get_deliveries(self) -> list[dict[str, Any]]:
-        """Fetch all open deliveries via the cookie-authenticated API proxy."""
-        params = {
-            "$expand": "Location,Type,Authorizations",
-            "$filter": "IsOpen eq true and Type/IsShownOnTenantHomePage eq true",
-            "$skip": "0",
-        }
+        """Fetch open deliveries from the EventLog microservice.
 
-        first_path = "EventLog/Resident/v1/Events"
-        url: str | None = first_path
-        deliveries: list[dict[str, Any]] = []
+        Uses ``eventlog-us1.buildinglink.com`` with the Bearer token from
+        the OIDC flow plus a dedicated API key.  Returns a plain JSON array
+        (not OData).
+        """
+        if not self.is_authenticated:
+            raise BuildingLinkApiError("Not authenticated — call login() first")
 
-        while url:
-            if url.startswith("http"):
-                # Absolute @odata.nextLink — rewrite to go through the proxy
-                parsed = urlparse(url)
-                path = parsed.path.lstrip("/")
-                data = await self._api_proxy(
-                    path + (f"?{parsed.query}" if parsed.query else "")
+        access_token = (self._token or {}).get("access_token", "")
+        if not access_token:
+            raise BuildingLinkApiError("No access token available")
+
+        url = f"{EVENTLOG_BASE_URL}/event-log/resident"
+        session = await self._ensure_session()
+
+        _LOGGER.debug("BuildingLink EventLog GET %s", url)
+
+        async with session.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-API-Key": EVENTLOG_API_KEY,
+                "Accept": "application/json",
+            },
+            ssl=True,
+        ) as resp:
+            if not resp.ok:
+                text = await resp.text()
+                raise BuildingLinkApiError(
+                    f"EventLog error {resp.status}: {text}"
                 )
-            else:
-                data = await self._api_proxy(
-                    url, params if url == first_path else None
-                )
-
-            if "value" in data:
-                deliveries.extend(data["value"])
-
-            url = data.get("@odata.nextLink")
-
-        return deliveries
+            return await resp.json()
 
     async def get_occupant(self) -> dict[str, Any]:
         """Get the current occupant info."""

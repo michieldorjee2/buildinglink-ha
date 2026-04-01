@@ -60,21 +60,11 @@ class BuildingLinkDeliverySensor(
         attrs: dict[str, Any] = {"deliveries": []}
 
         for d in deliveries:
-            delivery_info: dict[str, Any] = {
-                "id": d.get("Id"),
-                "description": d.get("Description", ""),
-                "is_open": d.get("IsOpen", True),
-                "open_date": d.get("OpenDate") or d.get("OpenDateOld"),
-            }
-
-            location = d.get("Location")
-            if location:
-                delivery_info["location"] = location.get("Description", "")
-
-            dtype = d.get("Type")
-            if dtype:
-                delivery_info["type"] = dtype.get("DescriptionLong", "")
-
-            attrs["deliveries"].append(delivery_info)
+            attrs["deliveries"].append({
+                "id": d.get("id"),
+                "type": d.get("eventTypeName", ""),
+                "description": d.get("openComment", ""),
+                "date": d.get("openUtc"),
+            })
 
         return attrs
